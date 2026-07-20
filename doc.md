@@ -7,3 +7,11 @@
 - We're waiting for all requests to be completed then if one request take too much time like 6~seconds we need to wait this one request finish to keep forward. Also if this request breaks down our program will be generate an error
 
 --------
+
+## Layer 1
+- Using worker pool with solid work numbers to processed each URL
+- Using sync.WaitGroup and channels to share communication between goroutines and control workflow properly
+- Now we're processing each URL concurrently and the most slow request will be our "bottleneck"
+
+## Problem
+- That `http.Get` without a timeout I criticized in Layer 0? It’s a ticking time bomb now. If one of those sites hangs and never responds, the worker that picked it up gets stuck in that `fetchTitle` call forever. It never returns to the jobs range, never processes another URL—you’ve permanently lost a worker. If several of them hang, the entire pool freezes, `wg.Wait()` never completes, the `results` channel never closes, and the main routine hangs. A single slow site brings the whole thing down.
