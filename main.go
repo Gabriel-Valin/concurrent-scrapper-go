@@ -26,6 +26,10 @@ const numWorkers = 5
 // requestTimeout é o prazo máximo de UMA requisição. Passou disso, aborta aquela.
 const requestTimeout = 10 * time.Second
 
+// rateLimit é o intervalo mínimo entre requisições no sistema todo.
+// 200ms => no máximo 5 requisições por segundo, somando todos os workers.
+const rateLimit = 200 * time.Millisecond
+
 type Result struct {
 	URL   string
 	Title string
@@ -43,10 +47,13 @@ func main() {
 	jobs := make(chan string)
 	results := make(chan Result)
 
+	ticker := time.NewTicker(rateLimit)
+	defer ticker.Stop()
+
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go worker(ctx, &wg, jobs, results)
+		go worker(ctx, &wg, jobs, results, ticker.C)
 	}
 
 	// Alimenta os jobs, mas respeitando o cancelamento: se ctx morrer,
@@ -81,11 +88,17 @@ func main() {
 	fmt.Printf("concluído em %v\n", time.Since(start))
 }
 
-func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan string, results chan<- Result) {
+func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan string, results chan<- Result, tick <-chan time.Time) {
 	defer wg.Done()
 	for url := range jobs {
+		// Espera a "permissão" do rate limiter — ou desiste se cancelado.
+		select {
+		case <-tick:
+		case <-ctx.Done():
+			return
+		}
+
 		title, err := fetchTitle(ctx, url)
-		// Envia o resultado, mas sem travar se o programa está encerrando.
 		select {
 		case results <- Result{URL: url, Title: title, Err: err}:
 		case <-ctx.Done():
