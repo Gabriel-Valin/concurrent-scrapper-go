@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -18,11 +21,11 @@ var urls = []string{
 	"https://stackoverflow.com",
 }
 
-// numWorkers is pool size: how many goroutines will be processed
-// Fixed and controlled - Pattern core.
 const numWorkers = 5
 
-// Result load the result after process URL error or not.
+// requestTimeout é o prazo máximo de UMA requisição. Passou disso, aborta aquela.
+const requestTimeout = 10 * time.Second
+
 type Result struct {
 	URL   string
 	Title string
@@ -32,53 +35,78 @@ type Result struct {
 func main() {
 	start := time.Now()
 
+	// Context raiz: cancelado por Ctrl+C (SIGINT) ou SIGTERM.
+	// signal.NotifyContext devolve um ctx que "morre" quando o sinal chega.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	jobs := make(chan string)
 	results := make(chan Result)
 
-	// 1) Sobe o pool de workers.
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go worker(&wg, jobs, results)
+		go worker(ctx, &wg, jobs, results)
 	}
 
-	// 2) Feeds jobs into a separate goroutine and closes the channel upon completion.
+	// Alimenta os jobs, mas respeitando o cancelamento: se ctx morrer,
+	// paramos de enfileirar em vez de insistir.
 	go func() {
+		defer close(jobs)
 		for _, url := range urls {
-			jobs <- url
+			select {
+			case jobs <- url:
+			case <-ctx.Done():
+				return
+			}
 		}
-		close(jobs)
 	}()
 
-	// 3) Close channel after all jobs processed
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// 4) Collect result until the results channel is closed
 	for res := range results {
 		if res.Err != nil {
-			fmt.Printf("error on %s: %v\n", res.URL, res.Err)
+			fmt.Printf("erro em %s: %v\n", res.URL, res.Err)
 			continue
 		}
 		fmt.Printf("%s -> %s\n", res.URL, res.Title)
 	}
 
-	fmt.Printf("\ndone in %v\n", time.Since(start))
+	if ctx.Err() != nil {
+		fmt.Printf("\ninterrompido: %v\n", ctx.Err())
+	}
+	fmt.Printf("concluído em %v\n", time.Since(start))
 }
 
-// worker consumes URLs from channel jobs, process each one and send Result.
-func worker(wg *sync.WaitGroup, jobs <-chan string, results chan<- Result) {
+func worker(ctx context.Context, wg *sync.WaitGroup, jobs <-chan string, results chan<- Result) {
 	defer wg.Done()
 	for url := range jobs {
-		title, err := fetchTitle(url)
-		results <- Result{URL: url, Title: title, Err: err}
+		title, err := fetchTitle(ctx, url)
+		// Envia o resultado, mas sem travar se o programa está encerrando.
+		select {
+		case results <- Result{URL: url, Title: title, Err: err}:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
-func fetchTitle(url string) (string, error) {
-	resp, err := http.Get(url)
+// fetchTitle agora recebe context e impõe um timeout por requisição.
+func fetchTitle(ctx context.Context, url string) (string, error) {
+	// Deriva um context com prazo: o menor entre o timeout da requisição
+	// e o cancelamento global herdado de ctx.
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
